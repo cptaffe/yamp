@@ -19,7 +19,10 @@
 
 typedef struct { uint16_t size; } Header;
 
-typedef struct { const char *payload; } Message;
+typedef struct {
+  Header header;
+  const char *payload;
+} Message;
 
 typedef struct {
   size_t len, i;
@@ -51,7 +54,8 @@ static void addConn(Server *s, int sock) {
 static void acceptConn(Server *s) {
   const size_t lsocki = 0;  // listening socket index
   struct sockaddr_in addr;
-  socklen_t len;
+  memset(&addr, 0, sizeof(addr));
+  socklen_t len = 0;
   int csock = accept(s->fds[lsocki].fd, (struct sockaddr *)&addr, &len);
   if (csock == -1) {
     if (errno == ENETDOWN || errno == EPROTO || errno == ENOPROTOOPT ||
@@ -72,7 +76,7 @@ static void acceptConn(Server *s) {
   }
 }
 
-static Message *handleMessage(Server *s) {
+static int handleMessage(Server *s, Message *m) {
   const int sock = s->fds[s->i].fd;
 
   // read in header
@@ -83,14 +87,12 @@ static Message *handleMessage(Server *s) {
       warn("%s: read(sock, ...)", __func__);
     }
     dropConn(s);  // empty read, socket was closed
-    return NULL;
+    return -1;
   } else if (len != sizeof(Header)) {
     warnx("%s: insufficient read %zd < %zd\n", __func__, len, sizeof(Header));
-    return NULL;
+    return -1;
   }
   h.size = ntohs(h.size);
-  printf("%d\n", h.size);
-
   // malloc appropriate buffer size
   uint8_t *bbuf = calloc(1, h.size);
   // read into buffer
@@ -107,12 +109,13 @@ static Message *handleMessage(Server *s) {
   } else if (blen < h.size) {
     warnx("insufficient read length: %zd < %d\n", blen, h.size);
   }
-  Message *m = calloc(sizeof(Message), 1);
-  m->payload = (const char *)bbuf;
-  return m;
+  *m = (Message){
+      .header = h, .payload = (const char *)bbuf,
+  };
+  return 0;
 }
 
-static Message *rcvMessage(Server *s) {
+static int rcvm(Server *s, Message *m) {
   const size_t lsocki = 0;  // listening socket index
   for (;;) {
     for (; s->i < s->len; s->i++) {
@@ -120,14 +123,12 @@ static Message *rcvMessage(Server *s) {
         printf("hup: dropping conn #%zd\n", s->i);
         dropConn(s);
       } else if (s->fds[s->i].revents & POLLIN) {
-        printf("in: reading conn #%zd\n", s->i);
         if (s->i == lsocki) {
           // listening socket
           acceptConn(s);
         } else {
-          Message *m = handleMessage(s);
-          if (m != NULL) {
-            return m;
+          if (handleMessage(s, m) != -1) {
+            return 0;
           }
         }
       } else if (s->fds[s->i].revents & POLLERR) {
@@ -145,11 +146,11 @@ static Message *rcvMessage(Server *s) {
 }
 
 // sets up server and forks to accept-loop
-static Server *newServer() {
+static int server(Server *s) {
   int sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
   if (sock == -1) {
     warn("%s: socket(...)", __func__);
-    return NULL;
+    return -1;
   }
 
   // bind to socket
@@ -162,7 +163,7 @@ static Server *newServer() {
     if (close(sock) == -1) {
       warn("%s: close(sock)", __func__);
     }  // try to close socket
-    return NULL;
+    return -1;
   }
 
   // mark socket for accept
@@ -172,11 +173,10 @@ static Server *newServer() {
     if (close(sock) == -1) {
       warn("%s: close(sock)", __func__);
     }  // try to close socket
-    return NULL;
+    return -1;
   }
 
   // construct server
-  Server *s = calloc(sizeof(Server), 1);
   *s = (Server){
       .fds = calloc(1, sizeof(struct pollfd)),
   };
@@ -185,7 +185,7 @@ static Server *newServer() {
   };
   s->len++;
 
-  return s;
+  return 0;
 }
 
 typedef struct {
@@ -193,11 +193,11 @@ typedef struct {
 } Client;
 
 // newClient connects to a server
-static Client *newClient() {
+static int client(Client *c) {
   int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (sock == -1) {
     warn("%s: socket(sock, ...)", __func__);
-    return NULL;
+    return -1;
   }
 
   if (connect(sock,
@@ -211,78 +211,76 @@ static Client *newClient() {
     if (close(sock) == -1) {
       warn("%s: close(sock)", __func__);
     }  // try to close socket
-    return NULL;
+    return -1;
   }
 
-  Client *c = calloc(sizeof(Client), 1);
   *c = (Client){
       .sock = sock,
   };
-  return c;
+  return 0;
 }
 
-static int sendMessage(Client *c, Header h, const uint8_t *b) {
+static int sendm(Client *c, Message *m) {
   // write message header
-  h.size = htons(h.size);
-  if (write(c->sock, &h, sizeof(Header)) == -1) {
+  size_t psize = m->header.size;
+  m->header.size = htons(m->header.size);
+  if (write(c->sock, &m->header, sizeof(m->header)) == -1) {
     warn("%s: write(sock, ...)", __func__);
     return -1;
   }
   // write message body
-  if (write(c->sock, b, h.size) == -1) {
+  if (write(c->sock, m->payload, psize) == -1) {
     warn("%s: write(sock, ...)", __func__);
     return -1;
   }
   return 0;
 }
 
-static int destroyClient(Client *c) {
+static int fclient(Client *c) {
   if (close(c->sock) == -1) {
     warn("%s: close(sock)", __func__);
     return -1;
   }
-  free(c);
   return 0;
 }
 
 static void test_client(int i) {
-  Client *c = newClient();
-  if (c) {
+  Client c;
+  if (client(&c) != -1) {
     // send message
-    size_t blen = 128;
-    uint8_t *buf = calloc(sizeof(char), blen);
-    int plen = snprintf((char *)buf, blen, "hey: %d", i);
-    if (plen == -1) {
+    char buf[10];
+    int len = snprintf(buf, sizeof(buf), "hey: %d", i);
+    if (len == -1) {
       warn("%s: snprintf(...)", __func__);
     } else {
-      sendMessage(c, (Header){.size = (uint16_t)(plen + 1)}, buf);
+      Message m = (Message){
+
+          .header = (Header){.size = (uint16_t)(len + 1)}, .payload = buf,
+      };
+      sendm(&c, &m);
     }
 
     // cleanup
-    destroyClient(c);
+    fclient(&c);
   }
 }
 
 int main() {
-  Server *s = newServer();
-
-  int schild = fork();
-  if (schild == -1) {
-    err(EXIT_FAILURE, "%s: fork()", __func__);
-  } else if (schild == 0) {
-    printf("forked server\n");
-    for (int i = 0; i < 100; i++) {
-      Message *m = rcvMessage(s);
-      printf("%s\n", m->payload);
-    }
-    exit(EXIT_SUCCESS);
+  Server svr;
+  if (server(&svr) == -1) {
+    errx(EXIT_FAILURE, "server failed to allocate");
   }
 
   for (int i = 0; i < 100; i++) {
-    if (!fork()) {
-      test_client(i);
-      exit(EXIT_SUCCESS);
+    test_client(i);
+  }
+
+  for (int i = 0; i < 100; i++) {
+    Message msg;
+    if (rcvm(&svr, &msg) == -1) {
+      errx(EXIT_FAILURE, "server failed to recvm(svr, msg)");
     }
+    printf("%s\n", msg.payload);
   }
 
   // wait for the server to exit properly
