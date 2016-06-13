@@ -30,7 +30,7 @@ typedef struct {
 } Server;
 
 // dropConn drops the current socket from the buffer
-static void dropConn(Server *s) {
+static void server_drop(Server *s) {
   // remove from list
   s->len--;
   if (s->i < s->len) {
@@ -41,7 +41,7 @@ static void dropConn(Server *s) {
 }
 
 // addConn adds a socket to the end of the buffer
-static void addConn(Server *s, int sock) {
+static void server_add(Server *s, int sock) {
   // add connection socket
   s->len++;
   s->fds = realloc(s->fds, s->len * sizeof(struct pollfd));
@@ -51,7 +51,7 @@ static void addConn(Server *s, int sock) {
 }
 
 // acceptConn accepts a new connection and adds it to the buffer
-static void acceptConn(Server *s) {
+static void server_accept(Server *s) {
   const size_t lsocki = 0;  // listening socket index
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
@@ -72,11 +72,13 @@ static void acceptConn(Server *s) {
       warn("%s: fcntl(sock, ...)", __func__);
       return;
     }
-    addConn(s, csock);
+    server_add(s, csock);
   }
 }
 
-static int handleMessage(Server *s, Message *m) {
+// TODO: Refactor so that partial reads and reads of any amount
+// succeed and the server can call this again when more data is avaliable.
+static int handlem(Server *s, Message *m) {
   const int sock = s->fds[s->i].fd;
 
   // read in header
@@ -86,7 +88,7 @@ static int handleMessage(Server *s, Message *m) {
     if (len == -1) {
       warn("%s: read(sock, ...)", __func__);
     }
-    dropConn(s);  // empty read, socket was closed
+    server_drop(s);  // empty read, socket was closed
     return -1;
   } else if (len != sizeof(Header)) {
     warnx("%s: insufficient read %zd < %zd\n", __func__, len, sizeof(Header));
@@ -100,11 +102,12 @@ static int handleMessage(Server *s, Message *m) {
   if (blen == -1) {
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
       // improperly formatted message, garbage
-      warn("%s: dropping message, improperly formatted", __func__);
+      warn("%s: dropping socket, improperly formatted", __func__);
+      server_drop(s);
     } else {
       // some sort of legitimate error, close & drop socket
       warn("%s: read(sock, ...)", __func__);
-      dropConn(s);
+      server_drop(s);
     }
   } else if (blen < h.size) {
     warnx("insufficient read length: %zd < %d\n", blen, h.size);
@@ -121,13 +124,13 @@ static int rcvm(Server *s, Message *m) {
     for (; s->i < s->len; s->i++) {
       if (s->fds[s->i].revents & POLLHUP) {
         printf("hup: dropping conn #%zd\n", s->i);
-        dropConn(s);
+        server_drop(s);
       } else if (s->fds[s->i].revents & POLLIN) {
         if (s->i == lsocki) {
           // listening socket
-          acceptConn(s);
+          server_accept(s);
         } else {
-          if (handleMessage(s, m) != -1) {
+          if (handlem(s, m) != -1) {
             return 0;
           }
         }
@@ -246,23 +249,23 @@ static int fclient(Client *c) {
 
 static void test_client(int i) {
   Client c;
-  if (client(&c) != -1) {
-    // send message
-    char buf[10];
-    int len = snprintf(buf, sizeof(buf), "hey: %d", i);
-    if (len == -1) {
-      warn("%s: snprintf(...)", __func__);
-    } else {
-      Message m = (Message){
-
-          .header = (Header){.size = (uint16_t)(len + 1)}, .payload = buf,
-      };
-      sendm(&c, &m);
-    }
-
-    // cleanup
-    fclient(&c);
+  if (client(&c) == -1) {
+    warnx("%s: client(&client) failed", __func__);
+    return;
   }
+  // send message
+  char buf[10];
+  int len = snprintf(buf, sizeof(buf), "hey: %d", i);
+  if (len == -1) {
+    warn("%s: snprintf(...)", __func__);
+    fclient(&c);
+    return;
+  }
+  Message m = (Message){
+      .header = (Header){.size = (uint16_t)(len + 1)}, .payload = buf,
+  };
+  sendm(&c, &m);
+  fclient(&c);
 }
 
 int main() {
@@ -271,16 +274,21 @@ int main() {
     errx(EXIT_FAILURE, "server failed to allocate");
   }
 
-  for (int i = 0; i < 100; i++) {
-    test_client(i);
+  int schild = fork();
+  if (schild == -1) {
+    err(EXIT_FAILURE, "%s: fork()", __func__);
+  } else if (schild == 0) {
+    for (int i = 0; i < 100; i++) {
+      Message msg;
+      if (rcvm(&svr, &msg) == -1) {
+        errx(EXIT_FAILURE, "server failed to recvm(svr, msg)");
+      }
+      printf("%s\n", msg.payload);
+    }
   }
 
   for (int i = 0; i < 100; i++) {
-    Message msg;
-    if (rcvm(&svr, &msg) == -1) {
-      errx(EXIT_FAILURE, "server failed to recvm(svr, msg)");
-    }
-    printf("%s\n", msg.payload);
+    test_client(i);
   }
 
   // wait for the server to exit properly
